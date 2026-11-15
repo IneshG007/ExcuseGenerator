@@ -49,6 +49,12 @@ const EFFORT = parseEffort(process.env.EFFORT);
 const MAX_SITUATION_CHARS = 500;
 const MAX_ATTEMPTS = 2; // first try + one retry on unusable output
 
+// True when a key is configured. The .env.example placeholder doesn't count.
+function hasApiKey() {
+  const key = process.env.ANTHROPIC_API_KEY?.trim();
+  return Boolean(key) && key !== "sk-ant-your-key-here";
+}
+
 // Models that accept server-side refusal fallbacks. If the model declines on a
 // safety false-positive, the API reruns the request on a fallback model in the same call.
 const FALLBACK_MODELS = new Set([
@@ -317,7 +323,7 @@ app.post("/api/excuse", async (req, res) => {
   const input = normalizeRequest(req.body);
   if (input.error) return res.status(400).json({ error: input.error });
 
-  if (!process.env.ANTHROPIC_API_KEY) {
+  if (!hasApiKey()) {
     return res.status(500).json({
       error: "The server is missing ANTHROPIC_API_KEY. Copy .env.example to .env and add your key.",
     });
@@ -351,7 +357,7 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`Excuse Report Card running at http://localhost:${PORT} (model: ${MODEL}, effort: ${EFFORT ?? "default"})`);
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.warn("Warning: ANTHROPIC_API_KEY is not set, so POST /api/excuse will return an error.");
+  if (!hasApiKey()) {
+    console.warn("Warning: ANTHROPIC_API_KEY is not set (add it to .env), so POST /api/excuse will return an error.");
   }
 });
