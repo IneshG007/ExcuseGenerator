@@ -1,0 +1,6 @@
+{
+  "audiences": ["Boss", "Mom", "Situationship", "Professor", "Best Friend", "Landlord"],
+  "styles": ["Text", "Voicemail", "Formal Email", "Handwritten Note"],
+  "escalation": { "min": 1, "max": 10 },
+  "truth": { "min": 0, "max": 100 }
+}
