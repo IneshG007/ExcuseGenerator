@@ -5,15 +5,17 @@
  * report card rating it. The API is defined in shared/contract.md, and the
  * allowed setting values are in shared/options.json.
  *
+ * Uses Google's Gemini API, which has a free tier.
+ *
  * How to run
  * ----------
  *   1. npm install
- *   2. cp .env.example .env   then set ANTHROPIC_API_KEY in .env
- *      (or export ANTHROPIC_API_KEY=sk-ant-... in your shell)
- *   3. npm start              then open http://localhost:3000
+ *   2. Get a free key at https://aistudio.google.com/apikey
+ *   3. cp .env.example .env   then set GEMINI_API_KEY in .env
+ *      (or export GEMINI_API_KEY=... in your shell)
+ *   4. npm start              then open http://localhost:3000
  *
- * Optional env vars: PORT (default 3000), MODEL (default claude-sonnet-5-5),
- * EFFORT (low | medium | high, default low).
+ * Optional env vars: PORT (default 3000), MODEL (default gemini-flash-latest).
  *
  * Endpoints
  * ---------
@@ -23,11 +25,10 @@
  *
  * Try it:
  *   curl -X POST http://localhost:3000/api/excuse -H "Content-Type: application/json" \
- *     -d '{"situation":"I missed my best friend'\''s birthday dinner","settings":{"escalation":8,"audience":"Best Friend","style":"Voicemail","truth":20}}'
+ *     -d '{"situation":"I did not finish my homework","settings":{"escalation":8,"audience":"Professor","style":"Formal Email","truth":20}}'
  */
 
 import express from "express";
-import Anthropic from "@anthropic-ai/sdk";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,26 +45,16 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const OPTIONS = JSON.parse(readFileSync(path.join(here, "shared", "options.json"), "utf8"));
 
 const PORT = Number(process.env.PORT) || 3000;
-const MODEL = process.env.MODEL || "claude-sonnet-5-5";
-const EFFORT = parseEffort(process.env.EFFORT);
+const MODEL = process.env.MODEL || "gemini-flash-latest";
+const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
 const MAX_SITUATION_CHARS = 500;
 const MAX_ATTEMPTS = 2; // first try + one retry on unusable output
 
 // True when a key is configured. The .env.example placeholder doesn't count.
 function hasApiKey() {
-  const key = process.env.ANTHROPIC_API_KEY?.trim();
-  return Boolean(key) && key !== "sk-ant-your-key-here";
+  const key = process.env.GEMINI_API_KEY?.trim();
+  return Boolean(key) && key !== "your-gemini-key-here";
 }
-
-// Models that accept server-side refusal fallbacks. If the model declines on a
-// safety false-positive, the API reruns the request on a fallback model in the same call.
-const FALLBACK_MODELS = new Set([
-  "claude-sonnet-5-5",
-  "claude-opus-5-5",
-  "claude-opus-5",
-  "claude-fable-5-2",
-  "claude-fable-5-1",
-]);
 
 const DEFAULTS = {
   escalation: Math.floor((OPTIONS.escalation.min + OPTIONS.escalation.max) / 2),
@@ -71,12 +62,6 @@ const DEFAULTS = {
   audience: OPTIONS.audiences[0],
   style: OPTIONS.styles[0],
 };
-
-function parseEffort(value) {
-  const v = (value || "low").trim().toLowerCase();
-  if (v === "none" || v === "off") return null; // omit the parameter entirely
-  return ["low", "medium", "high", "xhigh", "max"].includes(v) ? v : "low";
-}
 
 // ---------------------------------------------------------------------------
 // Input validation: clamp numbers, fall back to defaults for unknown values.
@@ -125,6 +110,13 @@ function normalizeRequest(body) {
 
 class UnusableOutputError extends Error {}
 class RefusalError extends Error {}
+class UpstreamError extends Error {
+  constructor(status, message, reason) {
+    super(message);
+    this.status = status;
+    this.reason = reason;
+  }
+}
 
 function extractJson(text) {
   let t = text.trim();
@@ -210,40 +202,48 @@ function trimToWordLimit(text, maxWords) {
 }
 
 // ---------------------------------------------------------------------------
-// Anthropic call
+// Gemini call (REST: models/{model}:generateContent)
 // ---------------------------------------------------------------------------
 
-let client;
-function getClient() {
-  client ??= new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, timeout: 60_000 });
-  return client;
+const BLOCKED_FINISH_REASONS = new Set(["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"]);
+
+function readGeminiText(data) {
+  if (data?.promptFeedback?.blockReason) throw new RefusalError(data.promptFeedback.blockReason);
+  const candidate = data?.candidates?.[0];
+  if (!candidate) throw new RefusalError("no candidates returned");
+  if (BLOCKED_FINISH_REASONS.has(candidate.finishReason)) throw new RefusalError(candidate.finishReason);
+  // Skip thought-summary parts; only the answer text matters.
+  return (candidate.content?.parts || [])
+    .filter((part) => typeof part.text === "string" && !part.thought)
+    .map((part) => part.text)
+    .join("");
 }
 
 async function callModel(system, user) {
-  const params = {
-    model: MODEL,
-    max_tokens: 8000,
-    system,
-    messages: [{ role: "user", content: user }],
-  };
-  if (EFFORT) params.output_config = { effort: EFFORT };
+  const url = `${GEMINI_BASE_URL}/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`;
+  const body = JSON.stringify({
+    systemInstruction: { parts: [{ text: system }] },
+    contents: [{ role: "user", parts: [{ text: user }] }],
+    generationConfig: { responseMimeType: "application/json" },
+  });
 
-  const response = FALLBACK_MODELS.has(MODEL)
-    ? await getClient().beta.messages.create({
-        ...params,
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default",
-      })
-    : await getClient().messages.create(params);
-
-  if (response.stop_reason === "refusal") {
-    throw new RefusalError(response.stop_details?.category || "refusal");
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY.trim() },
+      body,
+      signal: AbortSignal.timeout(60_000),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) return readGeminiText(data);
+    // Free-tier servers are sometimes briefly overloaded; one quick retry helps.
+    if (res.status >= 500 && attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      continue;
+    }
+    const reason = data?.error?.details?.find((d) => d?.reason)?.reason || data?.error?.status;
+    throw new UpstreamError(res.status, data?.error?.message || res.statusText, reason);
   }
-  // Adaptive thinking may add thinking blocks; only the text blocks carry the answer.
-  return response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("");
 }
 
 async function generateExcuse({ situation, settings }) {
@@ -282,26 +282,26 @@ function describeError(err) {
   if (err instanceof UnusableOutputError) {
     return [500, "The excuse generator got its story mixed up. Please try again."];
   }
-  if (err instanceof Anthropic.AuthenticationError || err instanceof Anthropic.PermissionDeniedError) {
-    return [500, "The server's Anthropic API key is invalid or lacks access."];
-  }
-  if (err instanceof Anthropic.NotFoundError) {
-    return [500, `The configured model "${MODEL}" was not found. Check the MODEL setting.`];
-  }
-  if (err instanceof Anthropic.RateLimitError) {
-    return [429, "Too many excuses at once. Wait a moment and try again."];
-  }
-  if (err instanceof Anthropic.BadRequestError) {
-    return [500, "The AI service rejected the request. Check the server logs."];
-  }
-  if (err instanceof Anthropic.APIConnectionTimeoutError) {
+  if (err?.name === "TimeoutError" || err?.name === "AbortError") {
     return [504, "The AI service took too long to answer. Please try again."];
   }
-  if (err instanceof Anthropic.APIConnectionError) {
-    return [502, "Could not reach the AI service. Please try again."];
-  }
-  if (err instanceof Anthropic.APIError) {
+  if (err instanceof UpstreamError) {
+    if (err.reason === "API_KEY_INVALID" || err.status === 401 || err.status === 403) {
+      return [500, "The server's Gemini API key is invalid. Check GEMINI_API_KEY in .env."];
+    }
+    if (err.status === 404) {
+      return [500, `The configured model "${MODEL}" was not found. Check the MODEL setting.`];
+    }
+    if (err.status === 429) {
+      return [429, "The free AI quota is used up for now. Wait a minute and try again."];
+    }
+    if (err.status === 400) {
+      return [500, "The AI service rejected the request. Check the server logs."];
+    }
     return [503, "The AI service is having trouble right now. Please try again shortly."];
+  }
+  if (err instanceof TypeError) {
+    return [502, "Could not reach the AI service. Please try again."];
   }
   return [500, "Something went wrong generating your excuse."];
 }
@@ -325,7 +325,7 @@ app.post("/api/excuse", async (req, res) => {
 
   if (!hasApiKey()) {
     return res.status(500).json({
-      error: "The server is missing ANTHROPIC_API_KEY. Copy .env.example to .env and add your key.",
+      error: "The server is missing GEMINI_API_KEY. Get a free key at aistudio.google.com/apikey and add it to .env.",
     });
   }
 
@@ -356,8 +356,8 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Excuse Report Card running at http://localhost:${PORT} (model: ${MODEL}, effort: ${EFFORT ?? "default"})`);
+  console.log(`Excuse Report Card running at http://localhost:${PORT} (model: ${MODEL})`);
   if (!hasApiKey()) {
-    console.warn("Warning: ANTHROPIC_API_KEY is not set (add it to .env), so POST /api/excuse will return an error.");
+    console.warn("Warning: GEMINI_API_KEY is not set (add it to .env), so POST /api/excuse will return an error.");
   }
 });
